@@ -21,6 +21,17 @@ class MeasurementStore(context: Context) {
         return file.readLines().takeLast(limit)
     }
 
+    fun all(): List<Measurement> {
+        val file = appContext.getFileStreamPath("measurements.jsonl")
+        if (!file.exists()) return emptyList()
+        return file.useLines { lines ->
+            lines.filter { it.isNotBlank() }
+                .mapNotNull { line -> runCatching { fromJson(JSONObject(line)) }.getOrNull() }
+                .toList()
+                .asReversed()
+        }
+    }
+
     fun latest(): Measurement? {
         val file = appContext.getFileStreamPath("measurements.jsonl")
         if (!file.exists()) return null
@@ -29,6 +40,14 @@ class MeasurementStore(context: Context) {
                 .mapNotNull { line -> runCatching { fromJson(JSONObject(line)) }.getOrNull() }
                 .lastOrNull()
         }
+    }
+
+    fun delete(timeMillis: Long) {
+        rewrite(all().filterNot { it.timeMillis == timeMillis }.asReversed())
+    }
+
+    fun clear() {
+        appContext.deleteFile("measurements.jsonl")
     }
 
     private fun toJson(measurement: Measurement): JSONObject {
@@ -110,5 +129,18 @@ class MeasurementStore(context: Context) {
     private fun JSONObject.optNullableDouble(name: String): Double? {
         if (!has(name) || isNull(name)) return null
         return getDouble(name)
+    }
+
+    private fun rewrite(measurements: List<Measurement>) {
+        if (measurements.isEmpty()) {
+            clear()
+            return
+        }
+        appContext.openFileOutput("measurements.jsonl", Context.MODE_PRIVATE).bufferedWriter().use { writer ->
+            measurements.forEach { measurement ->
+                writer.append(toJson(measurement).toString())
+                writer.newLine()
+            }
+        }
     }
 }

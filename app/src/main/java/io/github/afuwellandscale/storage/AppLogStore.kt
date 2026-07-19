@@ -37,6 +37,8 @@ class AppLogStore(context: Context) {
         return if (file.exists()) file.readText() else ""
     }
 
+    fun sizeBytes(): Long = appContext.getFileStreamPath(fileName).takeIf { it.exists() }?.length() ?: 0L
+
     fun clear() {
         appContext.deleteFile(fileName)
     }

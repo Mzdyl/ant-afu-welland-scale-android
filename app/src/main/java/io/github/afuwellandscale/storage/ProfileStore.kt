@@ -1,6 +1,7 @@
 package io.github.afuwellandscale.storage
 
 import android.content.Context
+import androidx.core.content.edit
 import io.github.afuwellandscale.model.ScaleDevice
 import io.github.afuwellandscale.model.UserProfile
 
@@ -17,26 +18,37 @@ class ProfileStore(context: Context) {
     }
 
     fun saveUserProfile(profile: UserProfile) {
-        prefs.edit()
-            .putInt("age", profile.age)
-            .putString("sex", profile.sex)
-            .putInt("height_cm", profile.heightCm)
-            .putString("unit", profile.unit)
-            .apply()
+        prefs.edit {
+            putInt("age", profile.age)
+            putString("sex", profile.sex)
+            putInt("height_cm", profile.heightCm)
+            putString("unit", profile.unit)
+        }
     }
 
     fun saveDevice(device: ScaleDevice) {
-        prefs.edit()
-            .putString("device_address", device.address)
-            .putString("device_name", device.name)
-            .putString("device_mac", device.actualMac)
-            .putInt("device_subtype", device.deviceSubtype)
-            .putInt("device_protocol_ver", device.protocolVer)
-            .putInt("device_protocol_device_type", device.protocolDeviceType)
-            .apply()
+        prefs.edit {
+            putString("device_address", device.address)
+            putString("device_name", device.name)
+            putString("device_mac", device.actualMac)
+            putInt("device_subtype", device.deviceSubtype)
+            putInt("device_protocol_ver", device.protocolVer)
+            putInt("device_protocol_device_type", device.protocolDeviceType)
+        }
     }
 
     fun loadSavedDeviceAddress(): String? = prefs.getString("device_address", null)
+
+    fun clearDevice() {
+        prefs.edit {
+            remove("device_address")
+            remove("device_name")
+            remove("device_mac")
+            remove("device_subtype")
+            remove("device_protocol_ver")
+            remove("device_protocol_device_type")
+        }
+    }
 
     fun loadSavedDevice(): ScaleDevice? {
         val address = prefs.getString("device_address", null) ?: return null

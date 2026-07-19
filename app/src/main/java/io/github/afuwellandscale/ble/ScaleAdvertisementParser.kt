@@ -1,6 +1,7 @@
 package io.github.afuwellandscale.ble
 
 import android.bluetooth.le.ScanRecord
+import androidx.core.util.size
 import io.github.afuwellandscale.model.ScaleDevice
 import io.github.afuwellandscale.util.hex
 import java.util.Locale
@@ -89,7 +90,7 @@ object ScaleAdvertisementParser {
                 if (record == null) return RawAdvertisement(null, emptyList(), "")
 
                 val candidates = mutableListOf<ByteArray>()
-                for (index in 0 until record.manufacturerSpecificData.size()) {
+                for (index in 0 until record.manufacturerSpecificData.size) {
                     val companyId = record.manufacturerSpecificData.keyAt(index)
                     val payload = record.manufacturerSpecificData.valueAt(index) ?: continue
                     val prefix = byteArrayOf((companyId and 0xFF).toByte(), ((companyId shr 8) and 0xFF).toByte())

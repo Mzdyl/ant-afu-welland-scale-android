@@ -1,68 +1,68 @@
-# 阿福沃莱体重秤 Android 应用
+# 阿福沃莱体重秤
 
-一个面向 `AFU-WL-TZ-A1` 的 Android 应用，用于读取蚂蚁阿福沃莱体重秤，并把可对应的数据写入 Health Connect。
+面向 `AFU-WL-TZ-A1` 的原生 Android 应用。自动连接体脂秤，读取体重和阻抗，在本地估算身体组成，并可写入 Health Connect。
 
 ## 功能
 
-- 自动扫描并保存体重秤设备，下次优先直连。
-- 读取体重、BMI、阻抗/ADC。
-- 本地估算体脂率、脂肪量、肌肉率、体水分、蛋白质、骨量、骨骼肌和皮下脂肪。
-- 写入 Health Connect：体重、体脂率、去脂体重、体水分量、骨量。
-- 保存测量记录到 `measurements.jsonl`。
-- 保存连接、最终测量、同步和错误等关键过程到 `app-log.jsonl`。
-- 重启应用后恢复最近一次完整测量，可继续同步到 Health Connect。
-- 界面内可复制或清空日志。
+- 自动扫描并保存设备，后续测量优先直接连接。
+- 实时显示体重，测量完成后展示 BMI、体脂、脂肪量、肌肉、骨骼肌、体水分、蛋白质、骨量和皮下脂肪。
+- 本地保存完整历史，可查看详情、单条删除或清空。
+- 授权后自动补同步历史，并在每次测量完成后自动同步；确定性记录 ID 可避免重复数据。
+- 只要求年龄、性别和身高，体重与阻抗由设备测量。
+- 保存精简诊断日志，支持复制、清空和自动限制体积。
+- Material 3 Expressive 界面、动态颜色、深色模式和官方 Material 图标。
 
-## 构建
+## 页面
+
+- **测量**：设备状态、实时体重、身体组成和一键测量。
+- **记录**：本地历史、前后体重变化和完整结果详情。
+- **设置**：个人资料、设备管理、Health Connect 授权状态、诊断与版本信息。
+
+## 环境
+
+- Android 8.0 或更高版本（API 26+）。
+- Android Studio 或 JDK 17+。
+- 蓝牙低功耗和定位权限。
+- Health Connect 为可选功能。
+
+## 构建与验证
 
 ```bash
-./gradlew :app:assembleDebug
+./gradlew :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
 ```
 
-生成文件：
+调试构建输出位于：
 
 ```text
 app/build/outputs/apk/debug/app-debug.apk
 ```
 
-安装到已连接手机：
+安装到已连接设备：
 
 ```bash
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-## 使用
+## 技术结构
 
-1. 打开应用，填写年龄、性别、身高。
-2. 授权蓝牙和定位权限。
-3. 轻踩体重秤唤醒设备。
-4. 点击“开始测量”。
-5. 首次连接成功后会保存设备，后续优先直连。
-6. 点击“授权并同步到 Health Connect”后，测量完成会自动同步。
+- Kotlin、Jetpack Compose、Material 3 Expressive。
+- Android BLE GATT，FFB0/FFB1/FFB2 服务与特征。
+- Health Connect 写入体重、体脂率、去脂体重、体水分量和骨量。
+- JSONL 本地测量记录和诊断日志。
 
-如果扫描不到设备，点击“重新扫描设备”，并确认系统蓝牙和定位服务已开启。
+Material 3 Expressive 目前使用 `androidx.compose.material3:material3:1.5.0-alpha24`，升级时需要重新运行测试和 Lint。
 
-## 日志
+## 数据与隐私
 
-界面底部显示最近日志，可直接点击“复制日志”。
+- 应用不会读取 Health Connect 中的其他健康数据。
+- 年龄、性别、身高、设备地址、测量记录和日志只保存在应用本地。
+- 测量记录与日志不参与云备份或设备迁移。
+- 蛋白质、骨骼肌和皮下脂肪没有对应的 Health Connect 标准记录，只在本地展示。
+- 身体组成来自本地 BIA 公式估算，适合观察趋势，不用于医疗诊断。
 
-调试时也可以用 adb 读取：
+诊断时可通过界面复制日志，也可以使用：
 
 ```bash
 adb shell run-as io.github.afuwellandscale cat files/app-log.jsonl
 adb shell run-as io.github.afuwellandscale cat files/measurements.jsonl
 ```
-
-日志不会记录每一次广播和重量波动，以免快速膨胀。扫描成功时记录设备与广播数据；扫描超时时只记录汇总统计。日志超过 256 KiB 后会自动保留最近 300 条。
-
-## Health Connect
-
-应用只申请写入权限，不读取其他健康数据。当前写入字段为：
-
-- Weight
-- Body fat
-- Lean body mass
-- Body water mass
-- Bone mass
-
-蛋白质、骨骼肌、皮下脂肪目前只在本地显示和记录，因为 Health Connect 没有一一对应的标准字段。

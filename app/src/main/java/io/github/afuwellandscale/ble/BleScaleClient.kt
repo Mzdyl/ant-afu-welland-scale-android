@@ -76,6 +76,7 @@ class BleScaleClient(
         }
     }
 
+    @SuppressLint("MissingPermission")
     fun stop() {
         stopScan()
         gatt?.disconnect()
@@ -116,6 +117,7 @@ class BleScaleClient(
     }
 
     private val scanCallback = object : ScanCallback() {
+        @SuppressLint("MissingPermission")
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             scanResultCount += 1
             val name = result.scanRecord?.deviceName ?: result.device.name
@@ -158,11 +160,7 @@ class BleScaleClient(
         status("连接中: ${device.name} ${device.address}")
         log("connect_start name='${device.name}' address=${device.address} mac=${device.actualMac ?: "-"}")
         val remote = adapter.getRemoteDevice(device.address)
-        gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            remote.connectGatt(appContext, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
-        } else {
-            remote.connectGatt(appContext, false, gattCallback)
-        }
+        gatt = remote.connectGatt(appContext, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
@@ -367,6 +365,7 @@ class BleScaleClient(
         return kotlin.math.round((weightKg / (height * height)) * 100.0) / 100.0
     }
 
+    @SuppressLint("MissingPermission")
     private fun closeGatt(gatt: BluetoothGatt) {
         runCatching { gatt.close() }
         if (this.gatt == gatt) this.gatt = null

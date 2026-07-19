@@ -1,23 +1,25 @@
 package io.github.afuwellandscale
 
 import android.Manifest
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothManager
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.widget.Button
-import android.widget.EditText
-import android.widget.RadioButton
-import android.widget.RadioGroup
-import android.widget.TextView
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.lifecycleScope
+import androidx.core.net.toUri
 import androidx.health.connect.client.HealthConnectClient
+import androidx.lifecycle.lifecycleScope
 import io.github.afuwellandscale.ble.BleScaleClient
 import io.github.afuwellandscale.health.HealthConnectWriter
 import io.github.afuwellandscale.model.Measurement
@@ -26,6 +28,11 @@ import io.github.afuwellandscale.model.UserProfile
 import io.github.afuwellandscale.storage.AppLogStore
 import io.github.afuwellandscale.storage.MeasurementStore
 import io.github.afuwellandscale.storage.ProfileStore
+import io.github.afuwellandscale.ui.AfuScaleApp
+import io.github.afuwellandscale.ui.HealthState
+import io.github.afuwellandscale.ui.ScaleActions
+import io.github.afuwellandscale.ui.ScaleUiState
+import io.github.afuwellandscale.ui.theme.AfuScaleTheme
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity(), BleScaleClient.Listener {
@@ -35,22 +42,9 @@ class MainActivity : ComponentActivity(), BleScaleClient.Listener {
     private lateinit var healthWriter: HealthConnectWriter
     private lateinit var bleClient: BleScaleClient
 
-    private lateinit var ageInput: EditText
-    private lateinit var heightInput: EditText
-    private lateinit var sexGroup: RadioGroup
-    private lateinit var maleRadio: RadioButton
-    private lateinit var femaleRadio: RadioButton
-    private lateinit var measureButton: Button
-    private lateinit var syncButton: Button
-    private lateinit var rescanButton: Button
-    private lateinit var copyLogButton: Button
-    private lateinit var clearLogButton: Button
-    private lateinit var statusText: TextView
-    private lateinit var resultText: TextView
-    private lateinit var logText: TextView
-
-    private var latestMeasurement: Measurement? = null
+    private var uiState by mutableStateOf(ScaleUiState())
     private var pendingScanFirst = false
+    private var hasAutoSyncedThisSession = false
 
     private val bluetoothPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
@@ -62,17 +56,30 @@ class MainActivity : ComponentActivity(), BleScaleClient.Listener {
         }
     }
 
+    private val enableBluetoothLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) {
+        val enabled = getSystemService(BluetoothManager::class.java).adapter.isEnabled
+        if (enabled) startMeasurement(pendingScanFirst) else onError("蓝牙未开启")
+    }
+
     private val healthPermissionLauncher = registerForActivityResult(
         HealthConnectWriter.requestPermissionContract(),
     ) {
         lifecycleScope.launch {
-            syncLatestMeasurement()
+            if (healthWriter.hasPermissions()) {
+                uiState = uiState.copy(healthState = HealthState.Ready, status = "Health Connect 已连接")
+                hasAutoSyncedThisSession = true
+                syncAllMeasurements()
+            } else {
+                uiState = uiState.copy(healthState = HealthState.PermissionRequired, status = "Health Connect 未授权")
+            }
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
+        enableEdgeToEdge()
 
         appLogStore = AppLogStore(this)
         profileStore = ProfileStore(this)
@@ -80,205 +87,309 @@ class MainActivity : ComponentActivity(), BleScaleClient.Listener {
         healthWriter = HealthConnectWriter(this)
         bleClient = BleScaleClient(this, this)
 
-        bindViews()
-        loadProfile()
-        loadLatestMeasurement()
-        refreshLogPreview()
-        measureButton.setOnClickListener { startMeasurement(scanFirst = false) }
-        rescanButton.setOnClickListener { startMeasurement(scanFirst = true) }
-        syncButton.setOnClickListener { requestOrSyncHealth() }
-        copyLogButton.setOnClickListener { copyLogsToClipboard() }
-        clearLogButton.setOnClickListener {
-            appLogStore.clear()
-            refreshLogPreview()
-            statusText.text = "日志已清空"
+        val history = measurementStore.all()
+        uiState = ScaleUiState(
+            profile = profileStore.loadUserProfile(),
+            savedDevice = profileStore.loadSavedDevice(),
+            latestMeasurement = history.firstOrNull(),
+            history = history,
+            logSizeBytes = appLogStore.sizeBytes(),
+        )
+
+        setContent {
+            AfuScaleTheme {
+                AfuScaleApp(
+                    state = uiState,
+                    actions = ScaleActions(
+                        onStartMeasurement = ::startMeasurement,
+                        onStopMeasurement = ::stopMeasurement,
+                        onSyncHealth = ::requestOrSyncHealth,
+                        onProfileChange = ::updateProfile,
+                        onForgetDevice = ::forgetDevice,
+                        onDeleteMeasurement = ::deleteMeasurement,
+                        onClearHistory = ::clearHistory,
+                        onCopyLogs = ::copyLogsToClipboard,
+                        onClearLogs = ::clearLogs,
+                    ),
+                )
+            }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (::healthWriter.isInitialized) refreshHealthState()
     }
 
     override fun onDestroy() {
-        bleClient.stop()
+        if (::bleClient.isInitialized) bleClient.stop()
         super.onDestroy()
-    }
-
-    private fun bindViews() {
-        ageInput = findViewById(R.id.ageInput)
-        heightInput = findViewById(R.id.heightInput)
-        sexGroup = findViewById(R.id.sexGroup)
-        maleRadio = findViewById(R.id.maleRadio)
-        femaleRadio = findViewById(R.id.femaleRadio)
-        measureButton = findViewById(R.id.measureButton)
-        syncButton = findViewById(R.id.syncButton)
-        rescanButton = findViewById(R.id.rescanButton)
-        copyLogButton = findViewById(R.id.copyLogButton)
-        clearLogButton = findViewById(R.id.clearLogButton)
-        statusText = findViewById(R.id.statusText)
-        resultText = findViewById(R.id.resultText)
-        logText = findViewById(R.id.logText)
-    }
-
-    private fun loadProfile() {
-        val profile = profileStore.loadUserProfile()
-        ageInput.setText(profile.age.toString())
-        heightInput.setText(profile.heightCm.toString())
-        if (profile.isMale) maleRadio.isChecked = true else femaleRadio.isChecked = true
-    }
-
-    private fun currentProfile(): UserProfile {
-        val profile = UserProfile(
-            age = ageInput.text.toString().toIntOrNull()?.coerceIn(5, 120) ?: 23,
-            sex = if (femaleRadio.isChecked) "female" else "male",
-            heightCm = heightInput.text.toString().toIntOrNull()?.coerceIn(80, 240) ?: 170,
-            unit = "kg",
-        )
-        profileStore.saveUserProfile(profile)
-        return profile
-    }
-
-    private fun loadLatestMeasurement() {
-        latestMeasurement = measurementStore.latest()
-        latestMeasurement?.let {
-            resultText.text = it.summary()
-            statusText.text = "已载入最近一次测量结果"
-        }
     }
 
     private fun startMeasurement(scanFirst: Boolean) {
         pendingScanFirst = scanFirst
+        if (uiState.isMeasuring) return
         if (!hasBluetoothPermissions()) {
             bluetoothPermissionLauncher.launch(requiredBluetoothPermissions())
             return
         }
+        val adapter = getSystemService(BluetoothManager::class.java).adapter
+        if (!adapter.isEnabled) {
+            enableBluetoothLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+            return
+        }
+
         appLogStore.append(
             "INFO",
             "start_measurement version=${BuildConfig.VERSION_NAME} scanFirst=$scanFirst",
         )
-        resultText.text = "等待测量结果..."
-        val savedDevice = profileStore.loadSavedDevice()
+        uiState = uiState.copy(
+            isMeasuring = true,
+            currentMeasurement = null,
+            status = if (scanFirst) "正在重新扫描体脂秤" else "正在准备测量",
+            logSizeBytes = appLogStore.sizeBytes(),
+        )
         bleClient.start(
-            profile = currentProfile(),
-            savedDevice = savedDevice,
+            profile = uiState.profile,
+            savedDevice = profileStore.loadSavedDevice(),
             scanFirst = scanFirst,
         )
     }
 
+    private fun stopMeasurement() {
+        bleClient.stop()
+        uiState = uiState.copy(isMeasuring = false, status = "测量已结束")
+        appLogStore.append("INFO", "measurement_cancelled")
+    }
+
+    private fun updateProfile(profile: UserProfile) {
+        profileStore.saveUserProfile(profile)
+        uiState = uiState.copy(profile = profile)
+    }
+
+    private fun forgetDevice() {
+        bleClient.stop()
+        profileStore.clearDevice()
+        uiState = uiState.copy(
+            savedDevice = null,
+            isMeasuring = false,
+            status = "已忘记设备",
+        )
+        appLogStore.append("INFO", "saved_device_cleared")
+    }
+
+    private fun deleteMeasurement(timeMillis: Long) {
+        measurementStore.delete(timeMillis)
+        reloadHistory(status = "记录已删除")
+    }
+
+    private fun clearHistory() {
+        measurementStore.clear()
+        uiState = uiState.copy(
+            history = emptyList(),
+            latestMeasurement = null,
+            currentMeasurement = null,
+            status = "本地记录已清空",
+        )
+        appLogStore.append("INFO", "measurement_history_cleared")
+    }
+
+    private fun reloadHistory(status: String = uiState.status) {
+        val history = measurementStore.all()
+        uiState = uiState.copy(
+            history = history,
+            latestMeasurement = history.firstOrNull(),
+            currentMeasurement = uiState.currentMeasurement?.takeIf { current ->
+                history.any { it.timeMillis == current.timeMillis }
+            },
+            status = status,
+        )
+    }
+
     private fun requestOrSyncHealth() {
-        appLogStore.append("INFO", "request_or_sync_health")
+        appLogStore.append("INFO", "request_or_sync_health records=${uiState.history.size}")
         when (healthWriter.availability()) {
-            HealthConnectClient.SDK_AVAILABLE -> {
-                lifecycleScope.launch {
-                    if (healthWriter.hasPermissions()) {
-                        syncLatestMeasurement()
-                    } else {
-                        healthPermissionLauncher.launch(healthWriter.permissions)
-                    }
+            HealthConnectClient.SDK_AVAILABLE -> lifecycleScope.launch {
+                if (healthWriter.hasPermissions()) {
+                    syncAllMeasurements()
+                } else {
+                    uiState = uiState.copy(healthState = HealthState.PermissionRequired)
+                    healthPermissionLauncher.launch(healthWriter.permissions)
                 }
             }
             HealthConnectClient.SDK_UNAVAILABLE_PROVIDER_UPDATE_REQUIRED -> {
-                statusText.text = "需要安装或更新 Health Connect"
+                uiState = uiState.copy(healthState = HealthState.InstallRequired)
                 startActivity(
                     Intent(
                         Intent.ACTION_VIEW,
-                        Uri.parse("market://details?id=com.google.android.apps.healthdata"),
+                        "market://details?id=com.google.android.apps.healthdata".toUri(),
                     ),
                 )
             }
-            else -> statusText.text = "当前系统不可用 Health Connect"
+            else -> uiState = uiState.copy(
+                healthState = HealthState.Unavailable,
+                status = "当前系统不可用 Health Connect",
+            )
         }
     }
 
-    private suspend fun syncLatestMeasurement() {
-        val measurement = latestMeasurement ?: measurementStore.latest()?.also {
-            latestMeasurement = it
-        }
-        if (measurement == null) {
-            statusText.text = "没有可同步的测量结果"
-            appLogStore.append("WARN", "health_sync_skipped no_completed_measurement")
+    private suspend fun syncAllMeasurements() {
+        val history = measurementStore.all()
+        if (!healthWriter.hasPermissions()) {
+            uiState = uiState.copy(healthState = HealthState.PermissionRequired)
             return
         }
+        if (history.isEmpty()) {
+            uiState = uiState.copy(healthState = HealthState.Ready, status = "Health Connect 已连接，暂无记录需要同步")
+            return
+        }
+        uiState = uiState.copy(healthState = HealthState.Syncing, status = "正在同步 ${history.size} 条记录")
         runCatching {
-            healthWriter.write(measurement)
+            healthWriter.writeAll(history)
         }.onSuccess {
-            statusText.text = "已同步到 Health Connect"
-            appLogStore.append("INFO", "health_sync_completed time=${measurement.timeMillis}")
-            refreshLogPreview()
+            uiState = uiState.copy(
+                healthState = HealthState.Synced,
+                status = "已同步 ${history.size} 条记录到 Health Connect",
+            )
+            appLogStore.append("INFO", "health_sync_completed count=${history.size}")
         }.onFailure {
-            statusText.text = "同步失败: ${it.message ?: it.javaClass.simpleName}"
+            uiState = uiState.copy(
+                healthState = HealthState.Error,
+                status = "同步失败: ${it.message ?: it.javaClass.simpleName}",
+            )
             appLogStore.append("ERROR", "health_sync_failed", it.message)
-            refreshLogPreview()
+        }
+        uiState = uiState.copy(logSizeBytes = appLogStore.sizeBytes())
+    }
+
+    private fun refreshHealthState() {
+        when (healthWriter.availability()) {
+            HealthConnectClient.SDK_AVAILABLE -> lifecycleScope.launch {
+                if (healthWriter.hasPermissions()) {
+                    if (!hasAutoSyncedThisSession && measurementStore.all().isNotEmpty()) {
+                        hasAutoSyncedThisSession = true
+                        syncAllMeasurements()
+                    } else if (uiState.healthState != HealthState.Syncing) {
+                        uiState = uiState.copy(healthState = HealthState.Ready)
+                    }
+                } else if (uiState.healthState != HealthState.Syncing) {
+                    uiState = uiState.copy(healthState = HealthState.PermissionRequired)
+                }
+            }
+            HealthConnectClient.SDK_UNAVAILABLE_PROVIDER_UPDATE_REQUIRED -> {
+                uiState = uiState.copy(healthState = HealthState.InstallRequired)
+            }
+            else -> uiState = uiState.copy(healthState = HealthState.Unavailable)
         }
     }
 
     override fun onStatus(message: String) {
-        statusText.text = message
         appLogStore.append("INFO", message)
-        refreshLogPreview()
+        uiState = uiState.copy(
+            status = message,
+            isMeasuring = if (message == "已断开") false else uiState.isMeasuring,
+            logSizeBytes = appLogStore.sizeBytes(),
+        )
     }
 
     override fun onLog(message: String) {
         appLogStore.append("DEBUG", message)
-        refreshLogPreview()
+        uiState = uiState.copy(logSizeBytes = appLogStore.sizeBytes())
     }
 
     override fun onDeviceFound(device: ScaleDevice) {
         profileStore.saveDevice(device)
-        statusText.text = "已保存设备: ${device.name} ${device.actualMac ?: device.address}"
-        appLogStore.append("INFO", "device_found address=${device.address} name=${device.name} mac=${device.actualMac ?: ""}")
-        refreshLogPreview()
+        appLogStore.append(
+            "INFO",
+            "device_found address=${device.address} name=${device.name} mac=${device.actualMac ?: ""}",
+        )
+        uiState = uiState.copy(savedDevice = device, logSizeBytes = appLogStore.sizeBytes())
     }
 
     override fun onMeasurement(measurement: Measurement) {
-        resultText.text = measurement.summary()
+        uiState = uiState.copy(currentMeasurement = measurement)
     }
 
     override fun onCompleted(measurement: Measurement) {
-        latestMeasurement = measurement
-        measurementStore.save(measurement)
-        resultText.text = measurement.summary()
+        latestCompleteMeasurement(measurement)
+        lifecycleScope.launch {
+            if (healthWriter.availability() == HealthConnectClient.SDK_AVAILABLE && healthWriter.hasPermissions()) {
+                runCatching { healthWriter.write(measurement) }
+                    .onSuccess {
+                        uiState = uiState.copy(
+                            healthState = HealthState.Synced,
+                            status = "测量完成，已同步到 Health Connect",
+                        )
+                        appLogStore.append("INFO", "health_auto_sync_completed time=${measurement.timeMillis}")
+                    }
+                    .onFailure {
+                        uiState = uiState.copy(
+                            healthState = HealthState.Error,
+                            status = "测量已保存，自动同步失败",
+                        )
+                        appLogStore.append("ERROR", "health_auto_sync_failed", it.message)
+                    }
+            } else if (healthWriter.availability() == HealthConnectClient.SDK_AVAILABLE) {
+                uiState = uiState.copy(
+                    healthState = HealthState.PermissionRequired,
+                    status = "测量完成，已保存到本机",
+                )
+            } else {
+                uiState = uiState.copy(status = "测量完成，已保存到本机")
+            }
+            uiState = uiState.copy(logSizeBytes = appLogStore.sizeBytes())
+        }
+    }
+
+    private fun latestCompleteMeasurement(measurement: Measurement) {
+        runCatching { measurementStore.save(measurement) }
+            .onFailure {
+                onError("保存测量结果失败", it)
+                return
+            }
         appLogStore.append(
             "INFO",
             "measurement_completed weight=${measurement.weightKg} bmi=${measurement.bmi} " +
                 "bodyFat=${measurement.composition?.bodyFatPercent ?: "-"}",
         )
-        refreshLogPreview()
-        lifecycleScope.launch {
-            if (healthWriter.hasPermissions()) {
-                syncLatestMeasurement()
-            } else {
-                statusText.text = "测量完成，已保存。授权后可同步到 Health Connect。"
-            }
-        }
+        val history = measurementStore.all()
+        uiState = uiState.copy(
+            latestMeasurement = measurement,
+            currentMeasurement = measurement,
+            history = history,
+            isMeasuring = false,
+            status = "测量完成，已保存到本机",
+            logSizeBytes = appLogStore.sizeBytes(),
+        )
     }
 
     override fun onError(message: String, throwable: Throwable?) {
-        statusText.text = message
         appLogStore.append("ERROR", message, throwable?.message)
-        refreshLogPreview()
-    }
-
-    private fun refreshLogPreview() {
-        val lines = appLogStore.latestLines(8)
-        logText.text = if (lines.isEmpty()) {
-            "暂无本地记录"
-        } else {
-            lines.joinToString("\n")
-        }
+        uiState = uiState.copy(
+            status = message,
+            isMeasuring = false,
+            logSizeBytes = appLogStore.sizeBytes(),
+        )
     }
 
     private fun copyLogsToClipboard() {
         val text = appLogStore.readAll()
         if (text.isBlank()) {
-            statusText.text = "没有可复制的日志"
+            uiState = uiState.copy(status = "没有可复制的日志")
             return
         }
-        val clipboard = getSystemService(ClipboardManager::class.java)
-        clipboard.setPrimaryClip(ClipData.newPlainText("app-log", text))
-        statusText.text = "日志已复制到剪贴板"
+        getSystemService(ClipboardManager::class.java)
+            .setPrimaryClip(ClipData.newPlainText("afu-scale-log", text))
+        uiState = uiState.copy(status = "日志已复制到剪贴板")
     }
 
-    private fun hasBluetoothPermissions(): Boolean {
-        return requiredBluetoothPermissions().all {
-            ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
-        }
+    private fun clearLogs() {
+        appLogStore.clear()
+        uiState = uiState.copy(status = "日志已清空", logSizeBytes = 0L)
+    }
+
+    private fun hasBluetoothPermissions(): Boolean = requiredBluetoothPermissions().all {
+        ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
     }
 
     private fun requiredBluetoothPermissions(): Array<String> {
@@ -286,6 +397,7 @@ class MainActivity : ComponentActivity(), BleScaleClient.Listener {
             arrayOf(
                 Manifest.permission.BLUETOOTH_SCAN,
                 Manifest.permission.BLUETOOTH_CONNECT,
+                Manifest.permission.ACCESS_COARSE_LOCATION,
                 Manifest.permission.ACCESS_FINE_LOCATION,
             )
         } else {

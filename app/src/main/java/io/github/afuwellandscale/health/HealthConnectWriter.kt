@@ -44,18 +44,22 @@ class HealthConnectWriter(private val context: Context) {
 
     suspend fun write(measurement: Measurement) {
         val client = clientOrNull() ?: error("Health Connect 不可用")
+        client.insertRecords(recordsFor(measurement))
+    }
+
+    suspend fun writeAll(measurements: List<Measurement>) {
+        val client = clientOrNull() ?: error("Health Connect 不可用")
+        measurements.flatMap(::recordsFor).chunked(100).forEach { records ->
+            client.insertRecords(records)
+        }
+    }
+
+    private fun recordsFor(measurement: Measurement): List<Record> {
         val time = Instant.ofEpochMilli(measurement.timeMillis)
         val zoneOffset = ZoneOffset.systemDefault().rules.getOffset(time)
-        val metadata = Metadata.activelyRecorded(
-            Device(
-                Device.TYPE_SCALE,
-                "Ant A-Fu Welland",
-                "AFU-WL-TZ-A1",
-            ),
-        )
         val records = mutableListOf<Record>(
             WeightRecord(
-                metadata = metadata,
+                metadata = metadata(measurement, "weight"),
                 weight = Mass.kilograms(measurement.weightKg),
                 time = time,
                 zoneOffset = zoneOffset,
@@ -65,35 +69,51 @@ class HealthConnectWriter(private val context: Context) {
         val composition = measurement.composition
         if (composition != null) {
             records += BodyFatRecord(
-                metadata = metadata,
+                metadata = metadata(measurement, "body-fat"),
                 percentage = Percentage(composition.bodyFatPercent),
                 time = time,
                 zoneOffset = zoneOffset,
             )
             records += LeanBodyMassRecord(
-                metadata = metadata,
+                metadata = metadata(measurement, "lean-mass"),
                 mass = Mass.kilograms(composition.fatFreeMassKg),
                 time = time,
                 zoneOffset = zoneOffset,
             )
             records += BodyWaterMassRecord(
-                metadata = metadata,
+                metadata = metadata(measurement, "body-water"),
                 mass = Mass.kilograms(composition.waterMassKg),
                 time = time,
                 zoneOffset = zoneOffset,
             )
             records += BoneMassRecord(
-                metadata = metadata,
+                metadata = metadata(measurement, "bone-mass"),
                 mass = Mass.kilograms(composition.boneMassKg),
                 time = time,
                 zoneOffset = zoneOffset,
             )
         }
 
-        client.insertRecords(records)
+        return records
+    }
+
+    private fun metadata(measurement: Measurement, type: String): Metadata {
+        return Metadata.activelyRecorded(
+            device = Device(
+                Device.TYPE_SCALE,
+                "Ant A-Fu Welland",
+                "AFU-WL-TZ-A1",
+            ),
+            clientRecordId = healthClientRecordId(measurement.timeMillis, type),
+            clientRecordVersion = 1,
+        )
     }
 
     companion object {
         fun requestPermissionContract() = PermissionController.createRequestPermissionResultContract()
     }
+}
+
+internal fun healthClientRecordId(timeMillis: Long, type: String): String {
+    return "afu-welland-$timeMillis-$type"
 }
