@@ -44,7 +44,7 @@ class BleScaleClient(
     private val mainHandler = Handler(Looper.getMainLooper())
     private val bluetoothManager = appContext.getSystemService(BluetoothManager::class.java)
     private val adapter get() = bluetoothManager.adapter
-    private val scanner get() = adapter.bluetoothLeScanner
+    private val scanner get() = adapter?.bluetoothLeScanner
     private val protocol = Scale27Protocol()
     private var gatt: BluetoothGatt? = null
     private var activeDevice: ScaleDevice? = null
@@ -52,24 +52,55 @@ class BleScaleClient(
     private var latestStableWeightKg: Double? = null
     private var completed = false
     private var scanning = false
+    private var running = false
+    private var canRescan = false
+    private val connectionTimeout = Runnable {
+        if (running && canRescan) {
+            canRescan = false
+            val previous = gatt
+            gatt = null
+            try {
+                previous?.disconnect()
+                previous?.close()
+            } catch (_: SecurityException) {
+                error("蓝牙权限已撤销，请重新授权")
+                return@Runnable
+            }
+            scan()
+        }
+    }
+    private val scanTimeout = Runnable {
+        if (scanning) {
+            stopScan()
+            log(scanSummary("scan_timeout"))
+            error("未找到体重秤，请轻踩唤醒后重试")
+        }
+    }
     private var scanResultCount = 0
     private var namedScaleResultCount = 0
     private val scanRejectCounts = linkedMapOf<String, Int>()
 
     fun start(profile: UserProfile, savedDevice: ScaleDevice?, scanFirst: Boolean) {
+        stop()
+        running = true
         this.profile = profile
         completed = false
         latestStableWeightKg = null
-        if (!adapter.isEnabled) {
-            error("蓝牙未开启")
-            return
-        }
         if (!hasBluetoothPermission()) {
             error("缺少蓝牙权限")
             return
         }
+        if (adapter?.isEnabled != true) {
+            error("蓝牙未开启")
+            return
+        }
+        mainHandler.postDelayed({
+            if (running) error("测量超时，请唤醒体重秤后重试")
+        }, 60_000L)
         if (savedDevice != null && !scanFirst) {
-            status("使用已保存设备: ${savedDevice.name} ${savedDevice.address}")
+            canRescan = true
+            mainHandler.postDelayed(connectionTimeout, 10_000L)
+            status("正在寻找已保存的体重秤")
             connect(savedDevice)
         } else {
             scan()
@@ -78,15 +109,19 @@ class BleScaleClient(
 
     @SuppressLint("MissingPermission")
     fun stop() {
+        running = false
+        canRescan = false
+        mainHandler.removeCallbacksAndMessages(null)
         stopScan()
-        gatt?.disconnect()
-        gatt?.close()
+        val previous = gatt
         gatt = null
+        runCatching { previous?.disconnect() }
+        runCatching { previous?.close() }
     }
 
     @SuppressLint("MissingPermission")
     private fun scan() {
-        status("正在扫描 AFU-WL-TZ-A1...")
+        status("正在寻找体重秤，请轻踩唤醒")
         scanResultCount = 0
         namedScaleResultCount = 0
         scanRejectCounts.clear()
@@ -99,18 +134,19 @@ class BleScaleClient(
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
-        bleScanner.startScan(null, settings, scanCallback)
-        mainHandler.postDelayed({
-            if (scanning) {
-                stopScan()
-                log(scanSummary("scan_timeout"))
-                error("未找到体重秤，请先轻踩唤醒设备")
-            }
-        }, 12_000L)
+        try {
+            bleScanner.startScan(null, settings, scanCallback)
+        } catch (exception: RuntimeException) {
+            scanning = false
+            error("无法扫描，请检查蓝牙后重试", exception)
+            return
+        }
+        mainHandler.postDelayed(scanTimeout, 20_000L)
     }
 
     @SuppressLint("MissingPermission")
     private fun stopScan() {
+        mainHandler.removeCallbacks(scanTimeout)
         if (!scanning) return
         scanning = false
         runCatching { scanner?.stopScan(scanCallback) }
@@ -119,6 +155,7 @@ class BleScaleClient(
     private val scanCallback = object : ScanCallback() {
         @SuppressLint("MissingPermission")
         override fun onScanResult(callbackType: Int, result: ScanResult) {
+            if (!scanning || !running) return
             scanResultCount += 1
             val name = result.scanRecord?.deviceName ?: result.device.name
             val outcome = ScaleAdvertisementParser.parseDetailed(
@@ -150,50 +187,54 @@ class BleScaleClient(
         }
 
         override fun onScanFailed(errorCode: Int) {
-            error("扫描失败: $errorCode")
+            if (scanning && running) error("扫描失败，请稍后重试 ($errorCode)")
         }
     }
 
     @SuppressLint("MissingPermission")
     private fun connect(device: ScaleDevice) {
         activeDevice = device
-        status("连接中: ${device.name} ${device.address}")
+        status("正在连接体重秤，请保持设备唤醒")
         log("connect_start name='${device.name}' address=${device.address} mac=${device.actualMac ?: "-"}")
-        val remote = adapter.getRemoteDevice(device.address)
+        val remote = adapter?.getRemoteDevice(device.address) ?: return
         gatt = remote.connectGatt(appContext, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+    }
+
+    private fun onGattEvent(connection: BluetoothGatt, action: () -> Unit) {
+        mainHandler.post {
+            if (running && gatt === connection) {
+                runCatching(action).onFailure { error("蓝牙连接中断，请重试", it) }
+            }
+        }
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
         @SuppressLint("MissingPermission")
-        override fun onConnectionStateChange(gatt: BluetoothGatt, gattStatus: Int, newState: Int) {
-            if (gattStatus != BluetoothGatt.GATT_SUCCESS) {
-                error("连接失败: $gattStatus")
-                closeGatt(gatt)
-                return
-            }
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
-                this@BleScaleClient.gatt = gatt
-                this@BleScaleClient.status("已连接，发现服务...")
-                gatt.discoverServices()
-            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                if (completed) {
-                    this@BleScaleClient.log("measurement_connection_closed")
+        override fun onConnectionStateChange(gatt: BluetoothGatt, gattStatus: Int, newState: Int) = onGattEvent(gatt) {
+            if (gattStatus != BluetoothGatt.GATT_SUCCESS || newState == BluetoothProfile.STATE_DISCONNECTED) {
+                if (canRescan) {
+                    mainHandler.removeCallbacks(connectionTimeout)
+                    connectionTimeout.run()
                 } else {
-                    this@BleScaleClient.status("已断开")
+                    error("连接已断开，请唤醒体重秤后重试")
                 }
-                closeGatt(gatt)
+            } else if (newState == BluetoothProfile.STATE_CONNECTED) {
+                canRescan = false
+                mainHandler.removeCallbacks(connectionTimeout)
+                status("已连接，正在准备测量")
+                if (!gatt.discoverServices()) error("无法读取体重秤服务，请重试")
             }
         }
 
-        override fun onServicesDiscovered(gatt: BluetoothGatt, gattStatus: Int) {
+        override fun onServicesDiscovered(gatt: BluetoothGatt, gattStatus: Int) = onGattEvent(gatt) {
             if (gattStatus != BluetoothGatt.GATT_SUCCESS) {
-                error("发现服务失败: $gattStatus")
-                return
+                error("无法读取体重秤服务，请重试")
+                return@onGattEvent
             }
             val service = gatt.getService(SERVICE_UUID)
             if (service == null) {
-                error("未找到体重秤服务 FFB0")
-                return
+                error("设备不支持测量服务")
+                return@onGattEvent
             }
             log("services_ready count=${gatt.services.size}")
             enableNotify(gatt, service)
@@ -201,33 +242,26 @@ class BleScaleClient(
 
         @Deprecated("Deprecated in Java")
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
-            handleNotification(characteristic.value)
+            val data = characteristic.value?.copyOf() ?: return
+            onGattEvent(gatt) { handleNotification(data) }
         }
 
-        override fun onCharacteristicChanged(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
-            value: ByteArray,
-        ) {
-            handleNotification(value)
-        }
+        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) =
+            onGattEvent(gatt) { handleNotification(value) }
 
-        @Deprecated("Deprecated in Java")
-        override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, gattStatus: Int) {
-            if (descriptor.uuid == CCC_UUID && gattStatus == BluetoothGatt.GATT_SUCCESS) {
-                this@BleScaleClient.status("已订阅通知，写入用户资料...")
-                writeUserInfo(gatt)
+        override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, gattStatus: Int) = onGattEvent(gatt) {
+            if (descriptor.uuid == CCC_UUID) {
+                if (gattStatus == BluetoothGatt.GATT_SUCCESS) {
+                    status("正在准备个人测量资料")
+                    writeUserInfo(gatt)
+                } else {
+                    error("无法接收体重秤数据，请重试")
+                }
             }
         }
 
-        override fun onCharacteristicWrite(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
-            gattStatus: Int,
-        ) {
-            if (gattStatus != BluetoothGatt.GATT_SUCCESS) {
-                error("写入用户资料失败: $gattStatus")
-            }
+        override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, gattStatus: Int) = onGattEvent(gatt) {
+            if (gattStatus != BluetoothGatt.GATT_SUCCESS) error("无法设置测量资料，请重试")
         }
     }
 
@@ -238,21 +272,25 @@ class BleScaleClient(
             error("未找到通知特征 FFB2")
             return
         }
-        gatt.setCharacteristicNotification(characteristic, true)
+        if (!gatt.setCharacteristicNotification(characteristic, true)) {
+            error("无法接收体重秤数据，请重试")
+            return
+        }
         val descriptor = characteristic.getDescriptor(CCC_UUID)
         if (descriptor == null) {
             error("未找到通知描述符")
             return
         }
         val value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            gatt.writeDescriptor(descriptor, value)
+        val started = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            gatt.writeDescriptor(descriptor, value) == BluetoothStatusCodes.SUCCESS
         } else {
             @Suppress("DEPRECATION")
             descriptor.value = value
             @Suppress("DEPRECATION")
             gatt.writeDescriptor(descriptor)
         }
+        if (!started) error("无法接收体重秤数据，请重试")
     }
 
     @SuppressLint("MissingPermission")
@@ -299,7 +337,7 @@ class BleScaleClient(
             gatt.writeCharacteristic(characteristic)
         }
         if (started) {
-            status("已发送用户资料，请上秤测量")
+            status("请赤脚上秤，保持站立直到测量完成")
         } else {
             error("用户资料写入未启动")
         }
@@ -349,6 +387,7 @@ class BleScaleClient(
             composition = composition,
         )
         completed = true
+        stop()
         log(
             "measurement_data weight=${measurement.weightKg} adc=${event.adcs} " +
                 "impedances=${event.impedances} algType=${event.algType}",
@@ -357,18 +396,11 @@ class BleScaleClient(
             listener.onMeasurement(measurement)
             listener.onCompleted(measurement)
         }
-        stop()
     }
 
     private fun bmi(weightKg: Double): Double {
         val height = profile.heightCm / 100.0
         return kotlin.math.round((weightKg / (height * height)) * 100.0) / 100.0
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun closeGatt(gatt: BluetoothGatt) {
-        runCatching { gatt.close() }
-        if (this.gatt == gatt) this.gatt = null
     }
 
     private fun status(message: String) {

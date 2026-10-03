@@ -22,6 +22,8 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -29,6 +31,8 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Bluetooth
 import androidx.compose.material.icons.rounded.ContentCopy
@@ -57,6 +61,9 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.ShortNavigationBar
@@ -66,6 +73,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -77,6 +85,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -111,15 +121,27 @@ fun AfuScaleApp(
     var destinationName by rememberSaveable { mutableStateOf(Destination.Measure.name) }
     val destination = Destination.valueOf(destinationName)
     var selectedMeasurement by remember { mutableStateOf<Measurement?>(null) }
+    val snackbar = remember { SnackbarHostState() }
+    LaunchedEffect(state.foregroundVisit) {
+        if (state.foregroundVisit > 0) destinationName = Destination.Measure.name
+    }
+    LaunchedEffect(state.notice) {
+        if (state.notice.isNotBlank()) snackbar.showSnackbar(state.notice)
+    }
 
     Scaffold(
+        snackbarHost = { SnackbarHost(snackbar) },
         topBar = {
             CenterAlignedTopAppBar(
                 title = {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text("阿福沃莱", style = MaterialTheme.typography.titleLarge)
+                        Text(if (destination == Destination.Measure) "阿福体重" else destination.label, style = MaterialTheme.typography.titleLarge)
                         Text(
-                            destination.label,
+                            when (destination) {
+                                Destination.Measure -> "轻踩唤醒体重秤，即可开始"
+                                Destination.History -> "每一次变化，都有记录"
+                                Destination.Settings -> "按你的习惯，准备好测量"
+                            },
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -136,7 +158,7 @@ fun AfuScaleApp(
                         icon = {
                             Icon(
                                 imageVector = item.icon,
-                                contentDescription = item.label,
+                                contentDescription = null,
                             )
                         },
                         label = { Text(item.label) },
@@ -155,6 +177,7 @@ fun AfuScaleApp(
                     .using(SizeTransform(clip = false))
             },
             label = "destination",
+            contentAlignment = Alignment.TopCenter,
         ) { target ->
             when (target) {
                 Destination.Measure -> MeasureScreen(state, actions)
@@ -191,23 +214,19 @@ fun AfuScaleApp(
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun MeasureScreen(state: ScaleUiState, actions: ScaleActions) {
-    val measurement = state.currentMeasurement ?: state.latestMeasurement
+    val measurement = if (state.isMeasuring) state.currentMeasurement else state.latestMeasurement
     LazyColumn(
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier.widthIn(max = 640.dp).fillMaxSize(),
         contentPadding = PaddingValues(horizontal = 20.dp, vertical = 16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        item { DeviceStatus(state) }
         item { MeasurementHero(state, measurement) }
-        measurement?.composition?.let { composition ->
-            item { CompositionMetrics(composition) }
-        }
         item {
             Button(
                 onClick = {
                     if (state.isMeasuring) actions.onStopMeasurement() else actions.onStartMeasurement(false)
                 },
-                modifier = Modifier.fillMaxWidth().height(64.dp),
+                modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp),
                 shape = MaterialTheme.shapes.extraLarge,
             ) {
                 Icon(
@@ -215,7 +234,29 @@ private fun MeasureScreen(state: ScaleUiState, actions: ScaleActions) {
                     contentDescription = null,
                 )
                 Spacer(Modifier.width(10.dp))
-                Text(if (state.isMeasuring) "结束测量" else "开始测量")
+                Text(if (state.isMeasuring) "暂停测量" else "重新测量")
+            }
+        }
+        item { DeviceStatus(state) }
+        if (state.isMeasuring) {
+            item {
+                Text(
+                    "赤脚站上秤面，保持身体稳定。测量完成后会自动保存，离开应用会暂停测量。",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        measurement?.composition?.let { composition ->
+            item { CompositionMetrics(composition) }
+        }
+        if (!state.isMeasuring && state.latestMeasurement != null) {
+            item {
+                Text(
+                    historyChange(state.history) ?: "已保存第一条记录，继续记录每一次变化",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                )
             }
         }
         item {
@@ -264,11 +305,11 @@ private fun DeviceStatus(state: ScaleUiState) {
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text(
-                    state.savedDevice?.name ?: "等待发现体脂秤",
+                    if (state.savedDevice != null) "阿福沃莱体脂秤" else "尚未连接体脂秤",
                     style = MaterialTheme.typography.titleMedium,
                 )
                 Text(
-                    state.savedDevice?.actualMac ?: "首次测量时自动扫描",
+                    if (state.savedDevice != null) "已记住设备 · 打开应用自动连接" else "首次测量会自动发现附近设备",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -287,7 +328,7 @@ private fun MeasurementHero(state: ScaleUiState, measurement: Measurement?) {
         shape = MaterialTheme.shapes.extraLarge,
     ) {
         Column(
-            modifier = Modifier.padding(horizontal = 24.dp, vertical = 22.dp),
+            modifier = Modifier.padding(horizontal = 24.dp, vertical = 26.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Row(
@@ -295,7 +336,13 @@ private fun MeasurementHero(state: ScaleUiState, measurement: Measurement?) {
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    state.status,
+                    when {
+                        state.isMeasuring && measurement != null -> "正在测量"
+                        state.isMeasuring -> "准备上秤"
+                        state.currentMeasurement != null -> "本次测量已保存"
+                        measurement != null -> "最近一次测量"
+                        else -> "准备好，记录今天的体重"
+                    },
                     style = MaterialTheme.typography.labelLarge,
                     modifier = Modifier.weight(1f),
                     maxLines = 2,
@@ -308,7 +355,7 @@ private fun MeasurementHero(state: ScaleUiState, measurement: Measurement?) {
                     )
                 }
             }
-            Spacer(Modifier.height(12.dp))
+            Spacer(Modifier.height(24.dp))
             AnimatedContent(
                 targetState = measurement?.weightKg,
                 transitionSpec = {
@@ -320,16 +367,24 @@ private fun MeasurementHero(state: ScaleUiState, measurement: Measurement?) {
                 Row(verticalAlignment = Alignment.Bottom) {
                     Text(
                         text = weight?.let { "%.2f".format(it) } ?: "--",
-                        style = MaterialTheme.typography.displayLarge,
+                        style = MaterialTheme.typography.displayLarge.merge(TextStyle(fontFeatureSettings = "tnum")),
                     )
                     Spacer(Modifier.width(8.dp))
                     Text("kg", style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(bottom = 8.dp))
                 }
             }
             Text(
-                measurement?.let { "BMI %.2f".format(it.bmi) } ?: "尚无测量结果",
+                measurement?.let { "BMI %.2f".format(it.bmi) } ?: "等待体重读数",
                 style = MaterialTheme.typography.bodyLarge,
             )
+            Spacer(Modifier.height(20.dp))
+            HorizontalDivider(color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.14f))
+            Spacer(Modifier.height(14.dp))
+            Text(state.status, style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center)
+            if (!state.isMeasuring && measurement != null) {
+                Spacer(Modifier.height(6.dp))
+                Text(formatDate(measurement.timeMillis), style = MaterialTheme.typography.labelMedium)
+            }
         }
     }
 }
@@ -361,9 +416,16 @@ private data class Metric(val label: String, val value: String, val detail: Stri
 
 @Composable
 private fun MetricRow(left: Metric, right: Metric) {
-    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        MetricTile(left, Modifier.weight(1f))
-        MetricTile(right, Modifier.weight(1f))
+    if (LocalConfiguration.current.fontScale > 1.3f) {
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            MetricTile(left, Modifier.fillMaxWidth())
+            MetricTile(right, Modifier.fillMaxWidth())
+        }
+    } else {
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            MetricTile(left, Modifier.weight(1f))
+            MetricTile(right, Modifier.weight(1f))
+        }
     }
 }
 
@@ -375,6 +437,8 @@ private fun MetricTile(metric: Metric, modifier: Modifier = Modifier) {
         shape = MaterialTheme.shapes.medium,
     ) {
         Column(Modifier.padding(15.dp)) {
+            Text(metric.label, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.height(6.dp))
             Text(metric.value, style = MaterialTheme.typography.titleLarge)
             metric.detail?.let {
                 Text(
@@ -383,12 +447,6 @@ private fun MetricTile(metric: Metric, modifier: Modifier = Modifier) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            Spacer(Modifier.height(3.dp))
-            Text(
-                metric.label,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
         }
     }
 }
@@ -401,7 +459,7 @@ private fun HistoryScreen(
 ) {
     var showClearDialog by remember { mutableStateOf(false) }
     LazyColumn(
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier.widthIn(max = 640.dp).fillMaxSize(),
         contentPadding = PaddingValues(horizontal = 20.dp, vertical = 16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
@@ -511,9 +569,13 @@ private fun SettingsScreen(state: ScaleUiState, actions: ScaleActions) {
     var ageText by rememberSaveable { mutableStateOf(state.profile.age.toString()) }
     var heightText by rememberSaveable { mutableStateOf(state.profile.heightCm.toString()) }
     var showForgetDialog by remember { mutableStateOf(false) }
+    var sex by rememberSaveable { mutableStateOf(state.profile.sex) }
+    val validAge = ageText.toIntOrNull()?.takeIf { it in 5..120 }
+    val validHeight = heightText.toIntOrNull()?.takeIf { it in 80..240 }
+    val profileChanged = validAge != state.profile.age || validHeight != state.profile.heightCm || sex != state.profile.sex
 
     LazyColumn(
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier.widthIn(max = 640.dp).fillMaxSize(),
         contentPadding = PaddingValues(horizontal = 20.dp, vertical = 16.dp),
         verticalArrangement = Arrangement.spacedBy(22.dp),
     ) {
@@ -524,12 +586,11 @@ private fun SettingsScreen(state: ScaleUiState, actions: ScaleActions) {
                         value = ageText,
                         onValueChange = { value ->
                             ageText = value.filter(Char::isDigit).take(3)
-                            ageText.toIntOrNull()?.takeIf { it in 5..120 }?.let {
-                                actions.onProfileChange(state.profile.copy(age = it))
-                            }
                         },
                         modifier = Modifier.weight(1f),
                         label = { Text("年龄") },
+                        enabled = !state.isMeasuring,
+                        supportingText = { Text("5–120 岁") },
                         suffix = { Text("岁") },
                         singleLine = true,
                         isError = ageText.toIntOrNull()?.let { it !in 5..120 } ?: true,
@@ -539,12 +600,11 @@ private fun SettingsScreen(state: ScaleUiState, actions: ScaleActions) {
                         value = heightText,
                         onValueChange = { value ->
                             heightText = value.filter(Char::isDigit).take(3)
-                            heightText.toIntOrNull()?.takeIf { it in 80..240 }?.let {
-                                actions.onProfileChange(state.profile.copy(heightCm = it))
-                            }
                         },
                         modifier = Modifier.weight(1f),
                         label = { Text("身高") },
+                        enabled = !state.isMeasuring,
+                        supportingText = { Text("80–240 cm") },
                         suffix = { Text("cm") },
                         singleLine = true,
                         isError = heightText.toIntOrNull()?.let { it !in 80..240 } ?: true,
@@ -555,18 +615,38 @@ private fun SettingsScreen(state: ScaleUiState, actions: ScaleActions) {
                 SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
                     listOf("male" to "男", "female" to "女").forEachIndexed { index, (value, label) ->
                         SegmentedButton(
-                            selected = state.profile.sex == value,
-                            onClick = { actions.onProfileChange(state.profile.copy(sex = value)) },
+                            selected = sex == value,
+                            enabled = !state.isMeasuring,
+                            onClick = { sex = value },
                             shape = SegmentedButtonDefaults.itemShape(index, 2),
                             label = { Text(label) },
                         )
                     }
                 }
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    if (state.isMeasuring) "测量中暂不能修改资料，请先暂停测量。" else "用于估算身体组成，请填写实际资料。修改后点击保存。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (state.isMeasuring) {
+                    TextButton(onClick = actions.onStopMeasurement) { Text("暂停测量并编辑") }
+                }
+                FilledTonalButton(
+                    onClick = {
+                        if (validAge != null && validHeight != null) {
+                            actions.onProfileChange(state.profile.copy(age = validAge, heightCm = validHeight, sex = sex))
+                        }
+                    },
+                    enabled = !state.isMeasuring && validAge != null && validHeight != null && profileChanged,
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text(if (profileChanged) "保存资料" else "资料已保存") }
             }
         }
         item {
             SettingsSection(Icons.Rounded.Bluetooth, "体脂秤") {
                 ListItem(
+                    colors = ListItemDefaults.colors(containerColor = Color.Transparent),
                     supportingContent = {
                         Text(state.savedDevice?.actualMac ?: "测量时自动发现并保存")
                     },
@@ -577,6 +657,7 @@ private fun SettingsScreen(state: ScaleUiState, actions: ScaleActions) {
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     FilledTonalButton(
                         onClick = { actions.onStartMeasurement(true) },
+                        enabled = !state.isMeasuring,
                         modifier = Modifier.weight(1f),
                     ) {
                         Icon(Icons.Rounded.Refresh, contentDescription = null)
@@ -598,6 +679,7 @@ private fun SettingsScreen(state: ScaleUiState, actions: ScaleActions) {
         item {
             SettingsSection(Icons.Rounded.HealthAndSafety, "Health Connect") {
                 ListItem(
+                    colors = ListItemDefaults.colors(containerColor = Color.Transparent),
                     supportingContent = { Text(healthStateDescription(state)) },
                     leadingContent = {
                         Icon(Icons.Rounded.HealthAndSafety, contentDescription = null)
@@ -712,20 +794,36 @@ private fun MeasurementDialog(
     onDismiss: () -> Unit,
     onDelete: () -> Unit,
 ) {
+    var confirmDelete by remember { mutableStateOf(false) }
+    if (confirmDelete) {
+        ConfirmDialog(
+            title = "删除这条记录？",
+            message = "仅删除本机记录，已同步到 Health Connect 的数据不受影响。",
+            confirmLabel = "删除",
+            onConfirm = onDelete,
+            onDismiss = { confirmDelete = false },
+        )
+        return
+    }
     AlertDialog(
         onDismissRequest = onDismiss,
         icon = { Icon(Icons.Rounded.MonitorWeight, contentDescription = null) },
         title = { Text(formatDate(measurement.timeMillis)) },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("%.2f kg · BMI %.2f".format(measurement.weightKg, measurement.bmi), style = MaterialTheme.typography.titleLarge)
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text("%.2f kg".format(measurement.weightKg), style = MaterialTheme.typography.headlineLarge)
+                Text("BMI %.2f".format(measurement.bmi), style = MaterialTheme.typography.titleMedium)
                 HorizontalDivider()
-                Text(measurement.summary(), style = MaterialTheme.typography.bodyMedium)
+                measurement.composition?.let { CompositionMetrics(it) }
+                Text("身体组成为本地估算，仅供趋势参考。", style = MaterialTheme.typography.bodySmall)
             }
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("完成") } },
         dismissButton = {
-            TextButton(onClick = onDelete) {
+            TextButton(onClick = { confirmDelete = true }) {
                 Icon(Icons.Rounded.Delete, contentDescription = null)
                 Spacer(Modifier.width(4.dp))
                 Text("删除")
@@ -752,7 +850,7 @@ private fun ConfirmDialog(
 }
 
 private fun formatDate(timeMillis: Long): String {
-    return SimpleDateFormat("M月d日 HH:mm", Locale.CHINA).format(Date(timeMillis))
+    return SimpleDateFormat("yyyy年M月d日 HH:mm", Locale.CHINA).format(Date(timeMillis))
 }
 
 private fun historyChange(history: List<Measurement>): String? {
@@ -777,11 +875,11 @@ private fun healthStateTitle(state: HealthState): String = when (state) {
 
 private fun healthStateDescription(state: ScaleUiState): String = when (state.healthState) {
     HealthState.Ready -> "可写入体重、体脂、去脂体重、体水分和骨量"
-    HealthState.Synced -> "${state.history.size} 条本地记录已提交"
+    HealthState.Synced -> state.healthMessage.ifBlank { "最新测量已同步" }
     HealthState.PermissionRequired -> "授权后可自动同步每次完整测量"
     HealthState.InstallRequired -> "点击下方按钮打开应用商店"
     HealthState.Syncing -> "正在提交本地记录"
-    HealthState.Error -> state.status
+    HealthState.Error -> state.healthMessage
     HealthState.Unavailable -> "设备不支持 Health Connect"
 }
 

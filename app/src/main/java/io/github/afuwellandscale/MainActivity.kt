@@ -30,6 +30,7 @@ import io.github.afuwellandscale.storage.MeasurementStore
 import io.github.afuwellandscale.storage.ProfileStore
 import io.github.afuwellandscale.ui.AfuScaleApp
 import io.github.afuwellandscale.ui.HealthState
+import io.github.afuwellandscale.ui.MeasurementSession
 import io.github.afuwellandscale.ui.ScaleActions
 import io.github.afuwellandscale.ui.ScaleUiState
 import io.github.afuwellandscale.ui.theme.AfuScaleTheme
@@ -45,11 +46,15 @@ class MainActivity : ComponentActivity(), BleScaleClient.Listener {
     private var uiState by mutableStateOf(ScaleUiState())
     private var pendingScanFirst = false
     private var hasAutoSyncedThisSession = false
+    private var measurementSession = MeasurementSession()
+    private var externalRequestInFlight = false
+    private var resumeMeasurementAfterRecreation = false
 
     private val bluetoothPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { result ->
-        if (result.values.all { it }) {
+        externalRequestInFlight = false
+        if (result.isNotEmpty() && hasBluetoothPermissions()) {
             startMeasurement(pendingScanFirst)
         } else {
             onError("蓝牙权限未授权")
@@ -59,26 +64,30 @@ class MainActivity : ComponentActivity(), BleScaleClient.Listener {
     private val enableBluetoothLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) {
-        val enabled = getSystemService(BluetoothManager::class.java).adapter.isEnabled
+        externalRequestInFlight = false
+        val enabled = getSystemService(BluetoothManager::class.java).adapter?.isEnabled == true
         if (enabled) startMeasurement(pendingScanFirst) else onError("蓝牙未开启")
     }
 
     private val healthPermissionLauncher = registerForActivityResult(
         HealthConnectWriter.requestPermissionContract(),
     ) {
+        externalRequestInFlight = false
         lifecycleScope.launch {
             if (healthWriter.hasPermissions()) {
-                uiState = uiState.copy(healthState = HealthState.Ready, status = "Health Connect 已连接")
+                uiState = uiState.copy(healthState = HealthState.Ready, healthMessage = "Health Connect 已连接")
                 hasAutoSyncedThisSession = true
                 syncAllMeasurements()
             } else {
-                uiState = uiState.copy(healthState = HealthState.PermissionRequired, status = "Health Connect 未授权")
+                uiState = uiState.copy(healthState = HealthState.PermissionRequired, healthMessage = "Health Connect 未授权")
             }
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        measurementSession = MeasurementSession(savedInstanceState?.getBoolean("auto_attempted") ?: false)
+        externalRequestInFlight = savedInstanceState?.getBoolean("external_request") ?: false
         enableEdgeToEdge()
 
         appLogStore = AppLogStore(this)
@@ -119,6 +128,26 @@ class MainActivity : ComponentActivity(), BleScaleClient.Listener {
     override fun onResume() {
         super.onResume()
         if (::healthWriter.isInitialized) refreshHealthState()
+        if (!externalRequestInFlight && measurementSession.shouldStart()) {
+            uiState = uiState.copy(foregroundVisit = uiState.foregroundVisit + 1)
+            startMeasurement(false)
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean(
+            "auto_attempted",
+            measurementSession.attempted && !uiState.isMeasuring && !resumeMeasurementAfterRecreation,
+        )
+        outState.putBoolean("external_request", externalRequestInFlight)
+        super.onSaveInstanceState(outState)
+    }
+
+    override fun onStop() {
+        resumeMeasurementAfterRecreation = isChangingConfigurations && uiState.isMeasuring
+        if (uiState.isMeasuring) stopMeasurement()
+        measurementSession.leave(externalRequestInFlight, isChangingConfigurations)
+        super.onStop()
     }
 
     override fun onDestroy() {
@@ -127,14 +156,22 @@ class MainActivity : ComponentActivity(), BleScaleClient.Listener {
     }
 
     private fun startMeasurement(scanFirst: Boolean) {
-        pendingScanFirst = scanFirst
         if (uiState.isMeasuring) return
+        pendingScanFirst = scanFirst
         if (!hasBluetoothPermissions()) {
+            uiState = uiState.copy(status = "请允许蓝牙和定位权限，以发现附近的体重秤")
+            externalRequestInFlight = true
             bluetoothPermissionLauncher.launch(requiredBluetoothPermissions())
             return
         }
         val adapter = getSystemService(BluetoothManager::class.java).adapter
+        if (adapter == null) {
+            onError("当前设备不支持蓝牙")
+            return
+        }
         if (!adapter.isEnabled) {
+            uiState = uiState.copy(status = "请开启蓝牙，随后会自动连接体重秤")
+            externalRequestInFlight = true
             enableBluetoothLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
             return
         }
@@ -149,22 +186,25 @@ class MainActivity : ComponentActivity(), BleScaleClient.Listener {
             status = if (scanFirst) "正在重新扫描体脂秤" else "正在准备测量",
             logSizeBytes = appLogStore.sizeBytes(),
         )
-        bleClient.start(
-            profile = uiState.profile,
-            savedDevice = profileStore.loadSavedDevice(),
-            scanFirst = scanFirst,
-        )
+        runCatching {
+            bleClient.start(
+                profile = uiState.profile,
+                savedDevice = profileStore.loadSavedDevice(),
+                scanFirst = scanFirst,
+            )
+        }.onFailure { onError("无法开始测量，请检查蓝牙后重试", it) }
     }
 
     private fun stopMeasurement() {
         bleClient.stop()
-        uiState = uiState.copy(isMeasuring = false, status = "测量已结束")
+        uiState = uiState.copy(isMeasuring = false, currentMeasurement = null, status = "测量已暂停，准备好后可重新开始")
         appLogStore.append("INFO", "measurement_cancelled")
     }
 
     private fun updateProfile(profile: UserProfile) {
+        if (uiState.isMeasuring) return
         profileStore.saveUserProfile(profile)
-        uiState = uiState.copy(profile = profile)
+        uiState = uiState.copy(profile = profile, notice = "个人资料已保存，下次测量生效")
     }
 
     private fun forgetDevice() {
@@ -214,6 +254,7 @@ class MainActivity : ComponentActivity(), BleScaleClient.Listener {
                     syncAllMeasurements()
                 } else {
                     uiState = uiState.copy(healthState = HealthState.PermissionRequired)
+                    externalRequestInFlight = true
                     healthPermissionLauncher.launch(healthWriter.permissions)
                 }
             }
@@ -228,7 +269,7 @@ class MainActivity : ComponentActivity(), BleScaleClient.Listener {
             }
             else -> uiState = uiState.copy(
                 healthState = HealthState.Unavailable,
-                status = "当前系统不可用 Health Connect",
+                healthMessage = "当前系统不可用 Health Connect",
             )
         }
     }
@@ -240,22 +281,22 @@ class MainActivity : ComponentActivity(), BleScaleClient.Listener {
             return
         }
         if (history.isEmpty()) {
-            uiState = uiState.copy(healthState = HealthState.Ready, status = "Health Connect 已连接，暂无记录需要同步")
+            uiState = uiState.copy(healthState = HealthState.Ready, healthMessage = "Health Connect 已连接，暂无记录需要同步")
             return
         }
-        uiState = uiState.copy(healthState = HealthState.Syncing, status = "正在同步 ${history.size} 条记录")
+        uiState = uiState.copy(healthState = HealthState.Syncing, healthMessage = "正在同步 ${history.size} 条记录")
         runCatching {
             healthWriter.writeAll(history)
         }.onSuccess {
             uiState = uiState.copy(
                 healthState = HealthState.Synced,
-                status = "已同步 ${history.size} 条记录到 Health Connect",
+                healthMessage = "已同步 ${history.size} 条记录到 Health Connect",
             )
             appLogStore.append("INFO", "health_sync_completed count=${history.size}")
         }.onFailure {
             uiState = uiState.copy(
                 healthState = HealthState.Error,
-                status = "同步失败: ${it.message ?: it.javaClass.simpleName}",
+                healthMessage = "同步失败: ${it.message ?: it.javaClass.simpleName}",
             )
             appLogStore.append("ERROR", "health_sync_failed", it.message)
         }
@@ -311,41 +352,39 @@ class MainActivity : ComponentActivity(), BleScaleClient.Listener {
     }
 
     override fun onCompleted(measurement: Measurement) {
-        latestCompleteMeasurement(measurement)
+        if (!latestCompleteMeasurement(measurement)) return
         lifecycleScope.launch {
             if (healthWriter.availability() == HealthConnectClient.SDK_AVAILABLE && healthWriter.hasPermissions()) {
                 runCatching { healthWriter.write(measurement) }
                     .onSuccess {
                         uiState = uiState.copy(
                             healthState = HealthState.Synced,
-                            status = "测量完成，已同步到 Health Connect",
+                            healthMessage = "最新测量已同步到 Health Connect",
                         )
                         appLogStore.append("INFO", "health_auto_sync_completed time=${measurement.timeMillis}")
                     }
                     .onFailure {
                         uiState = uiState.copy(
                             healthState = HealthState.Error,
-                            status = "测量已保存，自动同步失败",
+                            healthMessage = "测量已保存，自动同步失败",
                         )
                         appLogStore.append("ERROR", "health_auto_sync_failed", it.message)
                     }
             } else if (healthWriter.availability() == HealthConnectClient.SDK_AVAILABLE) {
                 uiState = uiState.copy(
                     healthState = HealthState.PermissionRequired,
-                    status = "测量完成，已保存到本机",
+                    healthMessage = "授权后可自动同步测量记录",
                 )
-            } else {
-                uiState = uiState.copy(status = "测量完成，已保存到本机")
             }
             uiState = uiState.copy(logSizeBytes = appLogStore.sizeBytes())
         }
     }
 
-    private fun latestCompleteMeasurement(measurement: Measurement) {
+    private fun latestCompleteMeasurement(measurement: Measurement): Boolean {
         runCatching { measurementStore.save(measurement) }
             .onFailure {
                 onError("保存测量结果失败", it)
-                return
+                return false
             }
         appLogStore.append(
             "INFO",
@@ -361,13 +400,16 @@ class MainActivity : ComponentActivity(), BleScaleClient.Listener {
             status = "测量完成，已保存到本机",
             logSizeBytes = appLogStore.sizeBytes(),
         )
+        return true
     }
 
     override fun onError(message: String, throwable: Throwable?) {
+        bleClient.stop()
         appLogStore.append("ERROR", message, throwable?.message)
         uiState = uiState.copy(
             status = message,
             isMeasuring = false,
+            currentMeasurement = null,
             logSizeBytes = appLogStore.sizeBytes(),
         )
     }
@@ -375,17 +417,17 @@ class MainActivity : ComponentActivity(), BleScaleClient.Listener {
     private fun copyLogsToClipboard() {
         val text = appLogStore.readAll()
         if (text.isBlank()) {
-            uiState = uiState.copy(status = "没有可复制的日志")
+            uiState = uiState.copy(notice = "没有可复制的日志")
             return
         }
         getSystemService(ClipboardManager::class.java)
             .setPrimaryClip(ClipData.newPlainText("afu-scale-log", text))
-        uiState = uiState.copy(status = "日志已复制到剪贴板")
+        uiState = uiState.copy(notice = "日志已复制到剪贴板")
     }
 
     private fun clearLogs() {
         appLogStore.clear()
-        uiState = uiState.copy(status = "日志已清空", logSizeBytes = 0L)
+        uiState = uiState.copy(notice = "日志已清空", logSizeBytes = 0L)
     }
 
     private fun hasBluetoothPermissions(): Boolean = requiredBluetoothPermissions().all {
