@@ -1,0 +1,118 @@
+name: Android builds
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+      - name: Install Android SDK
+        run: |
+          { yes || true; } | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'platforms;android-37.0' 'build-tools;36.0.0'
+      - name: Restore signing key
+        if: github.event_name != 'pull_request'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_SIGNING_KEYSTORE }}
+        run: |
+          test -n "$KEYSTORE_BASE64" || { echo 'Configure ANDROID_SIGNING_KEYSTORE before publishing builds.'; exit 1; }
+          umask 077
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/afu-signing.keystore"
+          echo "AFU_SIGNING_STORE_FILE=$RUNNER_TEMP/afu-signing.keystore" >> "$GITHUB_ENV"
+      - name: Test and build Debug and Release
+        env:
+          AFU_SIGNING_STORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_STORE_PASSWORD }}
+          AFU_SIGNING_KEY_ALIAS: ${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}
+          AFU_SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon :app:testDebugUnitTest :app:lintDebug :app:lintRelease :app:assembleDebug :app:assembleRelease
+      - name: Prepare APKs
+        env:
+          TRUSTED_BUILD: ${{ github.event_name != 'pull_request' }}
+        run: |
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk dist/afu-scale-debug.apk
+          if [ "$TRUSTED_BUILD" = true ]; then
+            cp app/build/outputs/apk/release/app-release.apk dist/afu-scale-release.apk
+            for apk in dist/*.apk; do
+              "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs "$apk"
+            done
+          else
+            cp app/build/outputs/apk/release/app-release-unsigned.apk dist/afu-scale-release-unsigned.apk
+          fi
+          cd dist
+          sha256sum *.apk > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apks
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-test-reports
+          path: |
+            app/build/reports/
+            app/build/test-results/
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Remove signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/afu-signing.keystore"
+
+  publish:
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-apks
+          path: dist
+      - name: Publish direct APK downloads
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BUILD_TAG: ci-${{ github.run_number }}-${{ github.run_attempt }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          cat > release-notes.md <<EOF_NOTES
+          Automated Android build from commit $GITHUB_SHA.
+
+          - afu-scale-release.apk: signed, optimized build for daily use.
+          - afu-scale-debug.apk: signed build with debugging enabled.
+          - SHA256SUMS: checksums for both APKs.
+
+          Both APKs use the same application ID and signing key. Install either as an update without uninstalling the existing app.
+
+          Build and test results: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          EOF_NOTES
+          gh release create "$BUILD_TAG" dist/*.apk dist/SHA256SUMS \
+            --target "$GITHUB_SHA" \
+            --title "Android CI build $BUILD_NUMBER" \
+            --notes-file release-notes.md \
+            --prerelease --latest=false
+          echo "Download: https://github.com/$GITHUB_REPOSITORY/releases/tag/$BUILD_TAG" >> "$GITHUB_STEP_SUMMARY"

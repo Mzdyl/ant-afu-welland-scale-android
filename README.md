@@ -69,3 +69,21 @@ Material 3 Expressive 目前使用 `androidx.compose.material3:material3:1.5.0-a
 adb shell run-as io.github.afuwellandscale cat files/app-log.jsonl
 adb shell run-as io.github.afuwellandscale cat files/measurements.jsonl
 ```
+
+## GitHub CI 与手机直接安装
+
+推送到 `main` 或手动运行 **Android builds** 会执行单元测试及 Debug / Release Lint，生成两个 APK：
+
+- `afu-scale-release.apk`：关闭调试、压缩代码和资源，适合日常使用。
+- `afu-scale-debug.apk`：保留调试能力，适合诊断。
+
+构建成功后，两个 APK 和 `SHA256SUMS` 会同时保存在 Actions 构建产物中，并发布到标记为 `ci-构建序号-重试次数` 的 GitHub 预发布页面。手机可直接打开仓库的 **Releases** 页面下载 APK，无需通过电脑传输。两个版本使用相同包名和签名，可以保留数据相互覆盖安装。
+
+CI 签名使用仓库 Actions Secrets，不提交到 Git：
+
+- `ANDROID_SIGNING_KEYSTORE`：现有安装签名密钥库的 Base64 内容。
+- `ANDROID_SIGNING_STORE_PASSWORD`、`ANDROID_SIGNING_KEY_ALIAS`、`ANDROID_SIGNING_KEY_PASSWORD`：对应的密码和别名。
+
+保留此签名密钥，后续更新必须使用相同签名。拉取请求构建不注入签名密钥、不发布预发布版本；其 Release APK 未签名，仅用于构建验证。
+
+本地构建签名 Release 时，设置 `AFU_SIGNING_STORE_FILE`、`AFU_SIGNING_STORE_PASSWORD`、`AFU_SIGNING_KEY_ALIAS` 和 `AFU_SIGNING_KEY_PASSWORD` 后执行 `./gradlew :app:assembleRelease`。未配置时输出未签名的 Release APK。

@@ -24,6 +24,28 @@ android {
         versionCode = 5
         versionName = "0.3.0"
     }
+
+    val signingStore = providers.environmentVariable("AFU_SIGNING_STORE_FILE").orNull
+    val ciSigning = signingStore?.takeIf { it.isNotBlank() }?.let { path ->
+        signingConfigs.create("ci") {
+            storeFile = file(path)
+            storePassword = providers.environmentVariable("AFU_SIGNING_STORE_PASSWORD").get()
+            keyAlias = providers.environmentVariable("AFU_SIGNING_KEY_ALIAS").get()
+            keyPassword = providers.environmentVariable("AFU_SIGNING_KEY_PASSWORD").get()
+        }
+    }
+
+    buildTypes {
+        debug {
+            if (ciSigning != null) signingConfig = ciSigning
+        }
+        release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+            signingConfig = ciSigning
+        }
+    }
 }
 
 dependencies {
